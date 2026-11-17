@@ -2,7 +2,7 @@
 
 Implementação em Python do algoritmo centralizado de exclusão mútua para sistemas distribuídos. Vários processos independentes disputam o acesso a um recurso compartilhado (o arquivo `resultado.txt`) e um **coordenador** garante que apenas um deles o utilize por vez.
 
-## Conceitos Básicos
+## Fundamentação teórica
 
 Em um sistema distribuído, vários processos executam de forma independente e concorrente, muitas vezes em máquinas diferentes, e se comunicam apenas por troca de mensagens. Quando mais de um processo precisa acessar um mesmo recurso (como um arquivo), o trecho de código que usa esse recurso é chamado de **região crítica**, e a **exclusão mútua** é a garantia de que no máximo um processo esteja dentro dela a cada instante, evitando conflitos como a escrita misturada de dados. No **algoritmo centralizado**, um dos processos assume o papel de **coordenador**: quem deseja entrar na região crítica envia uma mensagem `REQUEST`; o coordenador, quando o recurso está livre, responde com `GRANT`; e, ao sair, o processo avisa com `RELEASE`. Pedidos que chegam com o recurso ocupado esperam em uma **fila FIFO** (o primeiro a pedir é o primeiro a ser atendido), o que garante justiça e evita que algum processo fique esperando indefinidamente. A comunicação entre os processos é feita por **sockets TCP**, que oferecem um canal de bytes confiável entre duas pontas, e o coordenador usa **threads** (linhas de execução dentro de um mesmo programa) para fazer várias tarefas ao mesmo tempo, como aceitar conexões, receber mensagens e atender o terminal. Como as threads compartilham dados, é necessário protegê-los com **locks** (travas), garantindo que só uma thread os modifique por vez.
 
@@ -29,6 +29,7 @@ exclusao_mutua/
 ├── coordenador.py          # servidor: fila, algoritmo, log e interface
 ├── processo.py             # cliente: pede acesso e escreve no arquivo
 ├── executar_processos.py   # dispara n processos de uma vez
+├── verificar.py            # confere automaticamente resultado.txt e o log
 ├── resultado.txt           # gerado: recurso compartilhado
 └── coordenador.log         # gerado: registro das mensagens
 ```
@@ -39,6 +40,7 @@ exclusao_mutua/
 | `coordenador.py`        | Recebe conexões, mantém a fila, concede o acesso, gera o log e atende comandos do terminal.                     |
 | `processo.py`           | Executa o laço de requisições à região crítica.                                                                 |
 | `executar_processos.py` | Facilita os testes iniciando `n` instâncias de `processo.py`.                                                   |
+| `verificar.py`          | Confere a corretude de uma execução, lendo `resultado.txt` e `coordenador.log`.                                 |
 
 ## Protocolo de mensagens
 
@@ -55,7 +57,7 @@ TIPO|PROCESSO|ZEROS
 | `RELEASE` | 3      | Processo → Coordenador | `3\|3\|000000`       |
 
 - O primeiro campo é o identificador do tipo da mensagem; o segundo, o identificador do processo (origem em `REQUEST` e `RELEASE`, destino em `GRANT`).
-- Os zeros no final servem apenas para completar os 10 bytes. Por isso o identificador do processo pode ter no máximo **6 dígitos**.
+- Os zeros no final servem apenas para completar os 10 bytes. Como `1|` e `|` ocupam 3 bytes, o identificador do processo pode ter no máximo **7 dígitos**.
 
 ### `montar_mensagem(tipo, id_processo)`
 
@@ -192,6 +194,49 @@ fecha o socket
 
 Recebe `n`, `r` e `k` e inicia `n` cópias de `processo.py`, com IDs de 1 a `n`. O `subprocess.Popen` não espera o término do processo, então todos rodam ao mesmo tempo. Depois, `wait()` aguarda cada um terminar. O uso de `sys.executable` garante que seja usado o mesmo Python que está executando o script.
 
+## O script de verificação (`verificar.py`)
+
+Automatiza as conferências que o enunciado pede para a etapa de avaliação, evitando contar linhas e comparar horários e logs manualmente. Ele lê `resultado.txt` e `coordenador.log` de uma execução e imprime `[OK]` ou `[FALHOU]` para cada verificação.
+
+**Uso:**
+
+```bash
+python verificar.py <n> <r> [k]
+```
+
+`n` e `r` são os mesmos valores usados na execução; `k` é opcional e habilita a verificação do intervalo mínimo entre escritas.
+
+### Verificações realizadas
+
+| Arquivo           | Verificação                                                                    | Por que importa                                                                           |
+| ----------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `resultado.txt`   | Total de linhas igual a `n × r`                                                | Nenhum acesso foi perdido ou duplicado                                                    |
+| `resultado.txt`   | Horários em ordem crescente                                                    | As escritas respeitam a evolução do relógio do sistema                                    |
+| `resultado.txt`   | Cada processo escreveu `r` vezes                                               | Todos foram atendidos, sem privilegiar nem esquecer ninguém                               |
+| `resultado.txt`   | Escritas consecutivas separadas por pelo menos `k` s (só se `k` for informado) | Prova indireta da exclusão mútua: dois processos nunca estiveram juntos na região crítica |
+| `coordenador.log` | `REQUEST`, `GRANT` e `RELEASE` somam `n × r` cada                              | O ciclo completo ocorreu para todos os acessos                                            |
+| `coordenador.log` | Cada processo recebeu `r` `GRANT`s                                             | Contagem de atendimentos por processo correta                                             |
+| `coordenador.log` | `GRANT` e `RELEASE` sempre intercalados, do mesmo processo                     | Nunca houve dois processos na região crítica ao mesmo tempo                               |
+| `coordenador.log` | Ordem dos `REQUEST` igual à ordem dos `RELEASE`                                | Verificação exigida pelo enunciado                                                        |
+| `coordenador.log` | Ordem dos `GRANT` igual à ordem dos `REQUEST`                                  | A fila FIFO foi respeitada                                                                |
+
+### Como o script está organizado
+
+| Função                       | O que faz                                                                                |
+| ---------------------------- | ---------------------------------------------------------------------------------------- |
+| `conferir`                   | Imprime `[OK]` ou `[FALHOU]` e conta as falhas.                                          |
+| `ler_resultado` / `ler_log`  | Transformam cada arquivo em listas de dados: `(id, hora em ms)` e `(direção, tipo, id)`. |
+| `verificar_resultado`        | Executa as conferências sobre `resultado.txt`.                                           |
+| `grant_release_intercalados` | Filtra do log só os `GRANT` e `RELEASE` e confere se alternam, começando por `GRANT`.    |
+| `verificar_log`              | Executa as conferências sobre `coordenador.log`.                                         |
+
+Os horários são convertidos para milissegundos desde a meia-noite, o que simplifica as comparações. O código de saída é `0` se tudo passou e `1` se alguma verificação falhou, o que permite usar o script em automações.
+
+**Observações:**
+
+- Rode o script **depois** que todos os processos terminarem e **apenas com os arquivos de uma execução** (apague-os entre testes).
+- O `resultado.txt` guarda só `hora:minuto:segundo.ms`, sem a data. Uma execução que atravesse a meia-noite seria reportada como falha de ordenação dos horários.
+
 ## Fluxo completo de um exemplo
 
 Dois processos (1 e 2) pedem acesso quase ao mesmo tempo:
@@ -249,13 +294,23 @@ python processo.py <id> <ip> <porta> <r> <k>
 python processo.py 1 127.0.0.1 5000 3 1
 ```
 
-**3. Encerrar**
+**3. Verifique os resultados**
+
+Quando os processos terminarem, ainda no Terminal 2, rode o verificador com os mesmos valores de `n` e `r` (e, opcionalmente, `k`):
+
+```bash
+python verificar.py 5 3 1
+```
+
+**4. Encerrar**
 
 No Terminal 1, digite `3`. O coordenador fecha os sockets e termina.
 
 ## Como testar
 
 > Apague `resultado.txt` e `coordenador.log` entre os testes, pois ambos são abertos em modo append.
+>
+> Após cada execução, rode `python verificar.py <n> <r> <k>`: ele faz automaticamente as conferências descritas abaixo.
 
 ### Teste 1: funcionamento básico
 
@@ -269,6 +324,8 @@ Execute `python executar_processos.py 5 3 1` e aguarde (cerca de 15 segundos, po
    ```
 2. **Os horários** devem estar separados por **pelo menos `k` segundo(s)**. Se duas linhas tiverem horários mais próximos que isso, houve violação da exclusão mútua.
 3. **`coordenador.log`** deve seguir sempre o padrão `RECEBIDA REQUEST` → `ENVIADA GRANT` → `RECEBIDA RELEASE`, sem dois `GRANT` seguidos sem um `RELEASE` entre eles.
+
+Para conferir tudo de uma vez, execute `python verificar.py 5 3 1`. A saída esperada é `[OK]` em todas as linhas e a mensagem final `RESULTADO: todas as verificações passaram.`
 
 ### Teste 2: comandos da interface
 
@@ -286,11 +343,11 @@ Execute com mais processos e tempo menor, por exemplo:
 python executar_processos.py 20 5 0.2
 ```
 
-Repita as verificações do Teste 1 (agora com 100 linhas esperadas). Esse cenário aumenta a chance de expor problemas de concorrência, caso existam.
+Em seguida, rode `python verificar.py 20 5 0.2` (agora com 100 linhas esperadas). Esse cenário aumenta a chance de expor problemas de concorrência, caso existam.
 
 ### Teste 4: justiça da fila (FIFO)
 
-No `coordenador.log`, confira que a ordem dos `GRANT` enviados é a mesma ordem dos `REQUEST` recebidos (ignorando os pedidos já atendidos). Isso confirma que a fila FIFO está sendo respeitada.
+No `coordenador.log`, confira que a ordem dos `GRANT` enviados é a mesma ordem dos `REQUEST` recebidos (ignorando os pedidos já atendidos). Isso confirma que a fila FIFO está sendo respeitada. O `verificar.py` faz essa conferência automaticamente.
 
 ### Resumo das verificações
 
@@ -300,3 +357,5 @@ No `coordenador.log`, confira que a ordem dos `GRANT` enviados é a mesma ordem 
 | Completude       | Total de linhas em `resultado.txt` igual a `n × r`                                          |
 | Justiça (FIFO)   | Ordem dos `GRANT` igual à ordem dos `REQUEST` no log                                        |
 | Contagem correta | Comando `2` mostra `r` atendimentos para cada processo                                      |
+
+O `verificar.py` confere automaticamente todas as propriedades desta tabela (a contagem por processo é verificada a partir do log, em vez do comando `2`).
