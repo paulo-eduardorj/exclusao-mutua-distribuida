@@ -2,7 +2,7 @@
 
 Implementação em Python do algoritmo centralizado de exclusão mútua para sistemas distribuídos. Vários processos independentes disputam o acesso a um recurso compartilhado (o arquivo `resultado.txt`) e um **coordenador** garante que apenas um deles o utilize por vez.
 
-## Fundamentação teórica
+## Conceitos Básicos
 
 Em um sistema distribuído, vários processos executam de forma independente e concorrente, muitas vezes em máquinas diferentes, e se comunicam apenas por troca de mensagens. Quando mais de um processo precisa acessar um mesmo recurso (como um arquivo), o trecho de código que usa esse recurso é chamado de **região crítica**, e a **exclusão mútua** é a garantia de que no máximo um processo esteja dentro dela a cada instante, evitando conflitos como a escrita misturada de dados. No **algoritmo centralizado**, um dos processos assume o papel de **coordenador**: quem deseja entrar na região crítica envia uma mensagem `REQUEST`; o coordenador, quando o recurso está livre, responde com `GRANT`; e, ao sair, o processo avisa com `RELEASE`. Pedidos que chegam com o recurso ocupado esperam em uma **fila FIFO** (o primeiro a pedir é o primeiro a ser atendido), o que garante justiça e evita que algum processo fique esperando indefinidamente. A comunicação entre os processos é feita por **sockets TCP**, que oferecem um canal de bytes confiável entre duas pontas, e o coordenador usa **threads** (linhas de execução dentro de um mesmo programa) para fazer várias tarefas ao mesmo tempo, como aceitar conexões, receber mensagens e atender o terminal. Como as threads compartilham dados, é necessário protegê-los com **locks** (travas), garantindo que só uma thread os modifique por vez.
 
@@ -205,13 +205,6 @@ Dois processos (1 e 2) pedem acesso quase ao mesmo tempo:
 | 5     | Chega `RELEASE` do processo 1               | `[2]`  | falso            |
 | 6     | Algoritmo retira o 2 e envia `GRANT`        | `[]`   | verdadeiro       |
 | 7     | Processo 2 escreve, espera, envia `RELEASE` | `[]`   | falso            |
-
-## Limitações (deliberadas, por simplicidade)
-
-- Se um processo **travar** dentro da região crítica, o coordenador nunca recebe o `RELEASE` e os demais ficam esperando. Esse é o ponto fraco clássico do algoritmo centralizado; tratá-lo exigiria _timeouts_.
-- O coordenador é um **ponto único de falha**: se ele cair, todo o sistema para.
-- Os IDs dos processos devem ter no máximo 6 dígitos, por causa do tamanho fixo de 10 bytes.
-- O coordenador assume que cada ID de processo é único.
 
 ## Como executar
 

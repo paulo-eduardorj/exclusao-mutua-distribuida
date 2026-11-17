@@ -50,9 +50,9 @@ def atender_cliente(conexao):
             break
 
         tipo, id_processo = mensagem
-        registrar_log("RECEBIDA", tipo, id_processo)
 
         with condicao:
+            registrar_log("RECEBIDA", tipo, id_processo)
             sockets[id_processo] = conexao
             if tipo == REQUEST:
                 fila.append(id_processo)
