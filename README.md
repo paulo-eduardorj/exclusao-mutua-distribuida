@@ -71,9 +71,25 @@ Lê **exatamente 10 bytes** do socket e devolve uma tupla `(tipo, id_processo)`.
 
 ## O coordenador (`coordenador.py`)
 
+O coordenador segue o modelo visto em aula: um **único laço** que recebe uma mensagem por vez e a trata, usando uma fila `Q`.
+
+```
+Q                                  // fila de espera
+enquanto verdadeiro:
+    m = receive()
+    se m.request:
+        se Q está vazia: send(m.processo, Grant)
+        Q.add(m.processo)
+    se m.release:
+        Q.remove()
+        se Q não está vazia: send(Q.head(), Grant)
+```
+
+Como cada processo tem o seu próprio socket, não existe um único `receive()` que escute todos. A solução é separar as responsabilidades: threads leitoras só **recebem** e colocam as mensagens em uma caixa de entrada, e a thread do algoritmo lê dessa caixa, fazendo o papel do `receive()` do modelo.
+
 ### Threads
 
-O enunciado pede três responsabilidades concorrentes. Há ainda um detalhe: como o coordenador atende vários processos, alguém precisa ficar lendo cada socket para perceber os `REQUEST` e `RELEASE`. Para manter o código simples, foi usada uma **thread leitora pequena por cliente**, que apenas faz leitura bloqueante.
+O enunciado pede três responsabilidades concorrentes. Há ainda um detalhe: como o coordenador atende vários processos, alguém precisa ficar lendo cada socket. Para manter o código simples, foi usada uma **thread leitora pequena por cliente**, que apenas faz leitura bloqueante e encaminha a mensagem.
 
 | Thread                        | Função               | O que faz                                                                                                           |
 | ----------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------- |
@@ -84,57 +100,63 @@ O enunciado pede três responsabilidades concorrentes. Há ainda um detalhe: com
 
 **Alternativa descartada:** uma única thread usando `select`/`poll` para monitorar todos os sockets. Ela evita as threads leitoras, mas é mais difícil de entender. Ler com `recv` bloqueante é bem mais intuitivo.
 
+### Duas filas, dois papéis
+
+O código tem duas estruturas de fila, que não devem ser confundidas:
+
+| Estrutura          | Tipo          | Papel                                                                                                                             |
+| ------------------ | ------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `caixa_de_entrada` | `queue.Queue` | Recebe as **mensagens** vindas das threads leitoras, na ordem de chegada. É o que o `receive()` do modelo faz.                    |
+| `fila`             | `deque`       | É a fila `Q` do modelo: os **processos** que pediram acesso. O primeiro da fila é quem está na região crítica; os demais esperam. |
+
 ### Dados compartilhados
 
-| Variável         | Tipo    | Finalidade                                                                                     |
-| ---------------- | ------- | ---------------------------------------------------------------------------------------------- |
-| `fila`           | `deque` | Fila FIFO de IDs de processos aguardando. `append()` entra no fim e `popleft()` sai do início. |
-| `sockets`        | `dict`  | Mapeia `id do processo → socket`, para saber por qual conexão enviar o `GRANT`.                |
-| `atendimentos`   | `dict`  | Conta quantas vezes cada processo recebeu `GRANT` (comando 2).                                 |
-| `regiao_ocupada` | `bool`  | Indica se algum processo está na região crítica.                                               |
-| `encerrando`     | `bool`  | Sinaliza que o usuário pediu para encerrar.                                                    |
+| Variável           | Tipo          | Finalidade                                                                                                      |
+| ------------------ | ------------- | --------------------------------------------------------------------------------------------------------------- |
+| `caixa_de_entrada` | `queue.Queue` | Já é segura para várias threads: `put()` insere e `get()` bloqueia até haver uma mensagem.                      |
+| `fila`             | `deque`       | Fila `Q`. `append()` entra no fim e `popleft()` sai do início.                                                  |
+| `sockets`          | `dict`        | Mapeia `id do processo → socket`, para saber por qual conexão enviar o `GRANT`. Só a thread do algoritmo o usa. |
+| `atendimentos`     | `dict`        | Conta quantas vezes cada processo recebeu `GRANT` (comando 2).                                                  |
+| `trava_dados`      | `Lock`        | Protege `fila` e `atendimentos`, que a thread do algoritmo altera e a interface lê.                             |
 
-Todos esses dados são protegidos por **um único lock**, a `threading.Condition` chamada `condicao`. Ela serve a dois propósitos:
+Quem **escreve** na `fila` e em `atendimentos` é sempre a thread do algoritmo; a interface apenas **lê**. Por isso basta um `Lock` simples, usado nos momentos em que a fila ou os contadores mudam ou são lidos pela interface.
 
-1. **Exclusão mútua entre threads:** `with condicao:` garante que só uma thread mexa nos dados por vez.
-2. **Espera sem gastar CPU:** a thread do algoritmo chama `condicao.wait()` e dorme até que outra thread chame `condicao.notify()`, em vez de ficar verificando a fila em um laço infinito.
-
-O arquivo de log tem um lock separado (`trava_log`), pois sua escrita é independente dos demais dados.
+Não há mais variável para indicar se a região está ocupada: como no modelo, isso é implícito. Se a fila não está vazia, o primeiro dela está usando a região crítica.
 
 ### Thread leitora: `atender_cliente`
 
 ```
 repete:
     lê uma mensagem do cliente
-    registra no log (RECEBIDA)
-    com o lock:
-        guarda o socket do processo em sockets[id]
-        se REQUEST: coloca o id no fim da fila
-        se RELEASE: regiao_ocupada = False
-        acorda a thread do algoritmo (notify)
+    coloca (socket, tipo, id) na caixa de entrada
+fecha o socket
 ```
 
-O coordenador só descobre o ID de um cliente ao ler sua primeira mensagem. Por isso o socket é guardado em `sockets` a cada mensagem recebida (repetir a atribuição é inofensivo). O laço termina quando o cliente fecha a conexão ou ocorre um erro de socket.
+O laço termina quando o cliente fecha a conexão ou ocorre um erro de socket. O socket vai junto com a mensagem porque o coordenador só descobre o ID de um cliente ao ler sua primeira mensagem.
 
 ### Thread do algoritmo: `executar_algoritmo`
 
 ```
 repete:
-    com o lock:
-        enquanto (região ocupada ou fila vazia) e não encerrando: dorme (wait)
-        se encerrando: termina
-        id = retira o primeiro da fila
-        região ocupada = True
-        atendimentos[id] += 1
-    registra no log (ENVIADA GRANT)
-    envia GRANT ao processo
+    pega a próxima mensagem da caixa de entrada     (bloqueia se vazia)
+    se for o sinal de encerramento: termina
+    registra no log (RECEBIDA)
+    guarda o socket em sockets[id]
+
+    se REQUEST:
+        se a fila está vazia: envia GRANT ao processo
+        adiciona o processo ao fim da fila
+    se RELEASE:
+        remove o primeiro da fila
+        se a fila não está vazia: envia GRANT ao novo primeiro
 ```
 
 Pontos de atenção:
 
-- **`while`, e não `if`, no `wait()`:** ao acordar, a condição precisa ser reavaliada, pois outra thread pode ter alterado o estado antes.
-- **O envio fica fora do lock:** operações de rede podem demorar, e segurar o lock durante o envio travaria as outras threads sem necessidade.
-- **O log é gravado antes do envio:** isso garante que, no arquivo de log, o `GRANT` apareça antes do `RELEASE` correspondente.
+- **Uma mensagem por vez:** como só esta thread trata as mensagens, a pergunta do modelo ("quem sincroniza a chegada de pedidos?") tem resposta direta: a `queue.Queue` coloca as mensagens em fila e a thread do algoritmo as processa em sequência.
+- **Ler a fila sem a trava é seguro aqui:** a verificação `if not fila` é feita pela mesma thread que a modifica, e a interface apenas lê.
+- **`enviar_grant`:** registra o `GRANT` no log **antes** de enviá-lo (assim ele aparece antes do `RELEASE` correspondente), envia a mensagem e incrementa o contador de atendimentos.
+- **Sinal de encerramento:** a interface coloca `None` na caixa de entrada. Quando a thread do algoritmo o lê, ela termina.
 
 ### Log
 
@@ -148,6 +170,8 @@ Cada mensagem enviada ou recebida gera uma linha em `coordenador.log`, feita pel
 
 O formato é: instante (com milissegundos) | direção | tipo da mensagem | processo de origem ou destino. O `%f` do `strftime` gera microssegundos (6 dígitos) e o `[:-3]` corta os 3 últimos, sobrando os milissegundos.
 
+Como **somente a thread do algoritmo** escreve no log, as linhas aparecem exatamente na ordem em que as mensagens foram tratadas, e não é necessário um lock para o arquivo. Isso garante que a ordem dos `REQUEST` no log seja a mesma da fila.
+
 ### Interface de terminal
 
 Comandos aceitos pela thread de interface:
@@ -158,15 +182,15 @@ Comandos aceitos pela thread de interface:
 | `2`     | Imprime quantas vezes cada processo foi atendido. |
 | `3`     | Encerra a execução.                               |
 
-Ao ler fila e contadores, a interface usa o lock, para que nenhuma outra thread os modifique durante a leitura. O comando `3` ativa `encerrando`, acorda a thread do algoritmo com `notify_all()` e, em seguida, a função `main` fecha o servidor e todos os sockets.
+Ao ler a fila e os contadores, a interface usa `trava_dados`, para que a thread do algoritmo não os modifique durante a leitura. O comando `3` coloca o sinal de encerramento na caixa de entrada.
 
 ### Função principal: `main`
 
 1. Cria o socket do servidor, com `SO_REUSEADDR` (permite reiniciar o coordenador logo após fechá-lo, sem o erro "porta em uso").
 2. Associa o socket ao endereço e à porta (`bind`) e começa a escutar (`listen`).
-3. Inicia as threads de conexões e do algoritmo (ambas `daemon=True`, para morrerem junto com o programa).
+3. Inicia a thread de conexões (`daemon=True`, para morrer junto com o programa) e a thread do algoritmo.
 4. Executa a interface na thread principal.
-5. Ao sair da interface, fecha o servidor e os sockets dos clientes.
+5. Ao sair da interface, envia o sinal de encerramento, espera a thread do algoritmo terminar (`join`) e fecha o servidor e os sockets dos clientes.
 
 ## O processo (`processo.py`)
 
@@ -331,7 +355,7 @@ Para conferir tudo de uma vez, execute `python verificar.py 5 3 1`. A saída esp
 
 Com os processos rodando, volte ao Terminal 1 e digite:
 
-- `1`: deve mostrar a fila mudando (por exemplo, `[3, 5, 2]`).
+- `1`: deve mostrar a fila mudando (por exemplo, `[3, 5, 2]`, em que o `3` é quem está na região crítica).
 - `2`: ao final da execução, cada processo deve aparecer com `3 vez(es)`.
 - `3`: o coordenador deve encerrar sem erros.
 

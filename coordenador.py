@@ -1,3 +1,4 @@
+import queue
 import socket
 import threading
 from collections import deque
@@ -9,26 +10,21 @@ from mensagem import (REQUEST, GRANT, RELEASE, NOMES_TIPOS,
 ENDERECO = "0.0.0.0"
 PORTA = 5000
 
-fila = deque()
-sockets = {} # mapeia id_processo -> socket para saber por qual conexão enviar o GRANT
-atendimentos = {} # conta quantas vezes cada processo recebeu GRANT
-regiao_ocupada = False # indica se há processo na região crítica
-encerrando = False
+caixa_de_entrada = queue.Queue()  # mensagens recebidas, na ordem de chegada
+fila = deque()  # o primeiro da fila é quem está na região crítica
+sockets = {}
+atendimentos = {}
 
-condicao = threading.Condition() # lock de dados, usado para proteger fila, sockets, atendimentos e regiao_ocupada
-trava_log = threading.Lock() # lock separado para a escrita no arquivo de log
+trava_dados = threading.Lock()  # protege fila e atendimentos, que a interface também lê
 
 
-# chamada sempre que o coordenador envia ou recebe uma mensagem, para registrar no log
 def registrar_log(direcao, tipo, id_processo):
     instante = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     linha = f"{instante} | {direcao} | {NOMES_TIPOS[tipo]} | processo {id_processo}\n"
-    with trava_log:
-        with open("coordenador.log", "a") as arquivo:
-            arquivo.write(linha)
+    with open("coordenador.log", "a") as arquivo:
+        arquivo.write(linha)
 
 
-# bloqueia até um processo se conectar e cria a thread atender_cliente para atendê-lo
 def receber_conexoes(servidor):
     while True:
         try:
@@ -38,9 +34,7 @@ def receber_conexoes(servidor):
         threading.Thread(target=atender_cliente, args=(conexao,), daemon=True).start()
 
 
-# thread que atende um cliente, lendo mensagens e atualizando a fila de processos
 def atender_cliente(conexao):
-    global regiao_ocupada
     while True:
         try:
             mensagem = ler_mensagem(conexao)
@@ -50,59 +44,57 @@ def atender_cliente(conexao):
             break
 
         tipo, id_processo = mensagem
-
-        with condicao:
-            registrar_log("RECEBIDA", tipo, id_processo)
-            sockets[id_processo] = conexao
-            if tipo == REQUEST:
-                fila.append(id_processo)
-            elif tipo == RELEASE:
-                regiao_ocupada = False
-            condicao.notify()
+        caixa_de_entrada.put((conexao, tipo, id_processo))
 
     conexao.close()
 
 
-# thread que executa o algoritmo de exclusão mútua, enviando GRANT para processos na fila
+def enviar_grant(id_processo):
+    registrar_log("ENVIADA", GRANT, id_processo)
+    sockets[id_processo].sendall(montar_mensagem(GRANT, id_processo))
+    with trava_dados:
+        atendimentos[id_processo] = atendimentos.get(id_processo, 0) + 1
+
+
 def executar_algoritmo():
-    global regiao_ocupada
     while True:
-        with condicao:
-            while not encerrando and (regiao_ocupada or not fila):
-                condicao.wait()
-            if encerrando:
-                return
-            id_processo = fila.popleft()
-            regiao_ocupada = True
-            atendimentos[id_processo] = atendimentos.get(id_processo, 0) + 1
-            conexao = sockets[id_processo]
+        item = caixa_de_entrada.get()
+        if item is None:
+            return  # sinal de encerramento
 
-        registrar_log("ENVIADA", GRANT, id_processo)
-        conexao.sendall(montar_mensagem(GRANT, id_processo))
+        conexao, tipo, id_processo = item
+        registrar_log("RECEBIDA", tipo, id_processo)
+        sockets[id_processo] = conexao
+
+        if tipo == REQUEST:
+            # Só esta thread altera a fila, então ler sem a trava é seguro
+            if not fila:
+                enviar_grant(id_processo)
+            with trava_dados:
+                fila.append(id_processo)
+
+        elif tipo == RELEASE:
+            with trava_dados:
+                fila.popleft()
+                proximo = fila[0] if fila else None
+            if proximo is not None:
+                enviar_grant(proximo)
 
 
-# thread de interface com o usuário, que permite ver a fila, os atendimentos e encerrar o coordenador
 def executar_interface():
-    global encerrando
     while True:
         comando = input("Comando (1=fila, 2=atendimentos, 3=encerrar): ").strip()
         if comando == "1":
-            with condicao:
-                print("Fila atual:", list(fila))
+            with trava_dados:
+                print("Fila atual (o primeiro está na região crítica):", list(fila))
         elif comando == "2":
-            with condicao:
+            with trava_dados:
                 for id_processo, total in sorted(atendimentos.items()):
                     print(f"Processo {id_processo}: atendido {total} vez(es)")
         elif comando == "3":
-            with condicao:
-                encerrando = True
-                condicao.notify_all()
             break
 
 
-# thread principal, que cria o socket do servidor, inicia as threads e aguarda a interface encerrar
-# ao encerrar, fecha o socket do servidor e todas as conexões com os clientes
-# O coordenador encerra quando o usuário digita 3 na interface e não encerra sozinho, mesmo que todos os clientes se desconectem
 def main():
     servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -111,14 +103,16 @@ def main():
     print(f"Coordenador ouvindo na porta {PORTA}")
 
     threading.Thread(target=receber_conexoes, args=(servidor,), daemon=True).start()
-    threading.Thread(target=executar_algoritmo, daemon=True).start()
+    thread_algoritmo = threading.Thread(target=executar_algoritmo)
+    thread_algoritmo.start()
 
     executar_interface()
 
+    caixa_de_entrada.put(None)
+    thread_algoritmo.join()
     servidor.close()
-    with condicao:
-        for conexao in sockets.values():
-            conexao.close()
+    for conexao in sockets.values():
+        conexao.close()
     print("Coordenador encerrado.")
 
 
